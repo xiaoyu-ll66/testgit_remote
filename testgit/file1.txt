@@ -1,0 +1,523 @@
+
+from algorithms.structs import BaseAction,Crane,Plan,Span,Station
+from gwd_mapping import start_gwd_mapping,end_gwd_mapping,gf_gwd_mapping
+from collections import defaultdict,deque
+import heapq
+from datetime import timedelta,datetime
+import tqdm
+import json
+
+def sign(a):
+    return a>0
+
+def print_act(a):
+    line = datetime(2020,1,1,0,0,0)
+    return (a.start_time-line).seconds,(a.end_time-line).seconds,a.start_loc,a.end_loc
+
+def decide_loc(loc:str,flag:str):
+    if flag.startswith('s'):
+        available_locs = start_gwd_mapping[loc.upper()]
+    elif flag.startswith('e'):
+        available_locs = end_gwd_mapping[loc.upper()]
+    else:
+        raise ValueError
+    return [f"ST{e.upper()}" for e in available_locs]
+
+
+def search(all_plans,all_stations,all_cranes,init_actions,stack_capacity=500):
+    station_mapper = {e.name:e for e in all_stations}
+    crane_mapper = {e.name:e for e in all_cranes}
+    plan_mapper = {e.name:e for e in all_plans}
+
+    action_list_decisions1 = [(0,init_actions)]
+    action_list_decisions2 = []
+
+    for plan in tqdm.tqdm(all_plans):
+        for action_list_score,action_list in tqdm.tqdm(action_list_decisions1,leave=False):
+            action_list = sorted(action_list,key=lambda z:z.start_time)
+            for cur_crane in all_cranes:
+                if station_mapper[decide_loc(plan.start_loc,'start')[0]].span != cur_crane.span:
+                    continue
+                next_action_group = search_next_plan(plan,cur_crane,action_list,station_mapper,crane_mapper,plan_mapper)
+                for next_action_list_score,next_action_list in next_action_group:
+                    heapq.heappush(action_list_decisions2,(next_action_list_score,next_action_list))
+                while len(action_list_decisions2) > stack_capacity:
+                    heapq.heappop(action_list_decisions2)
+            pass
+        action_list_decisions1,action_list_decisions2 = action_list_decisions2,[]
+    while len(action_list_decisions1)>1:
+        heapq.heappop(action_list_decisions1)
+    return action_list_decisions1[0]
+
+    
+def build_multiple_actions_from_plan(plan,crane,action_list,crane_mapper,station_mapper):
+    start_stations = [station_mapper[e] for e in decide_loc(plan.start_loc,'start')]
+    end_stations = [station_mapper[e] for e in decide_loc(plan.end_loc,'end')]
+    all_actions = []
+    for crane_ in crane_mapper.values():
+        crane_.actions.clear()
+    for action in action_list:
+        action.crane.actions.append(action)
+    if len(start_stations)>1:
+        for prev_action in action_list[::-1]:
+            if prev_action.plan == plan.prev_plan:
+                if 'dz_2' in plan.name.split('|')[-1]:
+                    if prev_action.crane!=crane:
+                        return []
+                # plan.latest_down_time = prev_action.end_time + timedelta(minutes=1)
+                start_stations_ = [e for e in start_stations if e.loc == prev_action.end_loc]
+                if len(start_stations_)<1:
+                    if prev_action.end_station and prev_action.end_station.name[2:] in gf_gwd_mapping:
+                        start_station = station_mapper['ST'+gf_gwd_mapping[prev_action.end_station.name[2:]]]
+                    elif prev_action.end_station is not None:
+                        start_station = prev_action.end_station
+                    else:
+                        for action in action_list[::-1]:
+                            if action.plan == plan.prev_plan and action.end_station is not None:
+                                start_station = action.end_station
+                                break
+                        assert start_station is not None
+                    start_stations = [start_station]
+                else:
+                    start_stations = start_stations_
+                break
+                # raise NotImplementedError
+    
+    
+    for start_station in start_stations:
+        for end_station in end_stations:
+            last_action = crane.actions[-1]
+            last_location = last_action.end_loc
+            start_location = start_station.loc
+            end_location = end_station.loc
+            prepare_move_cost_time = (start_location - last_location)/crane.speed
+            wait_end_time = max(plan.earliest_up_time - timedelta(seconds=abs(prepare_move_cost_time)),last_action.end_time)
+
+            a1_start_time = min(wait_end_time,last_action.end_time)
+            a1_end_time = wait_end_time
+            a1_start_loc = last_action.end_loc
+            a1_end_loc = a1_start_loc
+
+            action1 = BaseAction(f"AC|{plan.name}|{start_station.name}|{end_station.name}_1",crane,plan,a1_start_loc,a1_end_loc,
+                                a1_start_time,a1_end_time,False,'wait',None,None,start_station,end_station)
+            
+            a2_start_loc = a1_end_loc
+            a2_end_loc = start_station.loc
+            a2_start_time = a1_end_time
+            a2_end_time = a2_start_time + timedelta(seconds=abs((a2_end_loc-a2_start_loc))/crane.speed)
+
+            action2 = BaseAction(f"AC|{plan.name}|{start_station.name}|{end_station.name}_2",crane,plan,a2_start_loc,a2_end_loc,
+                                a2_start_time,a2_end_time,False,'move',None,None,start_station,end_station)
+            
+            move_cost_time_raw = (end_location - start_location)/crane.speed
+            move_cost_time = timedelta(seconds=abs(move_cost_time_raw))
+            action3_start_time = action2.end_time
+
+            up_time = 30 if 'DZ' in start_station.name else crane.up_time - 60
+            down_time = 30 if 'DZ' in end_station.name else crane.down_time - 60
+            action3_up = BaseAction(f"AC|{plan.name}|{start_station.name}|{end_station.name}_3_up",crane,plan,start_location,start_location,
+                                action3_start_time,action3_start_time+timedelta(seconds = up_time),
+                                False,'work',None,None,start_station,end_station)
+            action3_move = BaseAction(f"AC|{plan.name}|{start_station.name}|{end_station.name}_3_move",crane,plan,start_location,end_location,
+                                action3_up.end_time,action3_up.end_time + move_cost_time,
+                                False,'move',None,None,start_station,end_station)
+            action3_down = BaseAction(f"AC|{plan.name}|{start_station.name}|{end_station.name}_3_down",crane,plan,end_location,end_location,
+                                action3_move.end_time,action3_move.end_time+timedelta(seconds = down_time),
+                                False,'work',None,None,end_station,end_station)
+            assert_action(action1),assert_action(action2),assert_action(action3_up),assert_action(action3_move),assert_action(action3_down)
+            action1.next_action,action2.next_action,action3_up.next_action,action3_move.next_action,action3_down.next_action=\
+                action2,action3_up,action3_move,action3_down,None
+            action1.prev_action,action2.prev_action,action3_up.prev_action,action3_move.prev_action,action3_down.prev_action =\
+                last_action,action1,action2,action3_up,action3_move
+            actions = [action1,action2,action3_up,action3_move,action3_down]
+            all_actions.append(actions)
+    return all_actions
+
+def is_segment_cross(x1,y1,x2,y2,x3,y3,x4,y4):
+    x1,x2,x3,x4 = map(lambda z:z.timestamp(),(x1,x2,x3,x4))
+    if max(x1, x2) < min(x3, x4) or max(y1, y2) < min(y3, y4) or min(x1, x2) > max(x3, x4) or min(y1, y2) > max(y3, y4):
+        return False
+    if ((x3 - x1) * (y3 - y4) - (y3 - y1) * (x3 - x4)) * (
+            (x3 - x2) * (y3 - y4) - (y3 - y2) * (x3 - x4)) < 0 and (
+            (x1 - x3) * (y1 - y2) - (y1 - y3) * (x1 - x2)) * (
+            (x1 - x4) * (y1 - y2) - (y1 - y4) * (x1 - x2)) < 0:
+        return True
+    else:
+        return False
+
+def is_action_segment_cross(a,b,safe_distance_delta=0):
+    return is_segment_cross(a.start_time,a.start_loc,a.end_time,a.end_loc,
+                                b.start_time,b.start_loc+safe_distance_delta,b.end_time,b.end_loc+safe_distance_delta)
+
+def assert_action(action):
+    assert action.end_time+timedelta(seconds=5) >= action.start_time
+def assert_init_position(a,b):
+    if a.crane.init_position > b.crane.init_position:
+        a,b = b,a
+    assert b.start_loc > a.start_loc
+    assert b.end_loc > a.end_loc
+def dump_all_actions(all_actions):
+    cranes = list(set([action.crane.name for action in all_actions]))
+    all_res = [[] for _ in range(len(cranes))]
+    for action in all_actions:
+        ind = cranes.index(action.crane.name)
+        all_res[ind].append([print_act(action),action.crane.span.name])
+    with open("all_crane_actions.json",'w') as f:
+        json.dump(all_res,f)
+
+def dump_all_crane_actions(all_crane_spans):
+    all_res = []
+    for crane in all_crane_spans:
+        res = [print_act(action) for action in crane.actions]
+        all_res.append(res)
+    with open("all_crane_actions.json",'w') as f:
+        json.dump(all_res,f)        
+
+def fix_action_time(action):
+    a = action
+    if a.start_time < a.prev_action.end_time:
+        gap_time = a.prev_action.end_time - a.start_time
+        if 'wait' in a.type:
+            digest_time = min(gap_time,a.end_time-a.start_time)
+            a.start_time += digest_time
+            gap_time -= digest_time
+        a.end_time += gap_time
+        a.start_time += gap_time
+    
+def do_a_action(a_action_choise,same_span_cranes):
+    a = a_action_choise
+    if len(a.name.split('|'))>100:
+        raise AssertionError("陷入死循环")
+    if a.prev_action is not None:
+        pa = a.prev_action
+        if a.start_time != pa.end_time or a.start_loc != pa.end_loc:
+            if 'wait' in a.type:
+                if a.next_action is None:
+                    raise ValueError("wait 后面为什么没有action")
+                na = a.next_action
+                while na and 'wait' in na.type:
+                    a.end_time = na.end_time
+                    a.next_action = na.next_action
+                    na = a.next_action
+                if pa.end_time > a.start_time:
+                    digest_time = pa.end_time - a.start_time
+                    a.start_time += digest_time
+                if a.start_loc != pa.end_loc:
+                    a.start_loc = a.end_loc = pa.end_loc
+                if na and a.end_loc != na.start_loc:
+                    dis = abs(na.end_loc - a.end_loc)
+                    time_sec = timedelta(seconds = dis/na.crane.speed)
+                    start_time = na.end_time - time_sec
+                    if start_time <a.end_time:
+                        a.end_time = max(start_time,a.start_time)
+                if a.start_time > a.end_time:
+                    a.end_time = a.start_time
+                
+            elif 'move' in a.type:
+                if pa.end_time < a.start_time:
+                    start_loc = pa.end_loc
+                    target_loc = a.end_loc
+                    tmp_start_time= a.end_time - timedelta(seconds=abs(target_loc- start_loc)/a.crane.speed)
+                    if tmp_start_time >pa.end_time:
+                        new_w = BaseAction(f'{pa.name}|insert_wait',a.crane,a.plan,start_loc,start_loc,pa.end_time,tmp_start_time,
+                                           False,'wait',pa.prev_action,None,pa.end_station,pa.end_station)
+                        new_m = BaseAction(f'{pa.name}|insert_move',a.crane,a.plan,start_loc,target_loc,tmp_start_time,a.end_time,
+                                           False,'move',new_w,None,pa.end_station,a.end_station)
+                        if pa.next_action:
+                            pa.next_action = new_w
+                        new_w.next_action = new_m
+                        new_m.next_action = a.next_action
+
+                        if a.next_action:
+                            a.next_action.prev_action = new_m
+                        new_m.prev_action = new_w
+                        new_w.prev_action = pa
+                        return new_w
+                    else:
+                        start_time = pa.end_time
+                        end_time = start_time + timedelta(seconds=abs(target_loc- start_loc)/a.crane.speed)
+                else:
+                    start_loc = pa.end_loc
+                    start_time = pa.end_time
+                    target_loc = a.end_loc
+                    end_time = start_time + timedelta(seconds=abs(target_loc- start_loc)/a.crane.speed)
+                if end_time < a.end_time:
+                    new_start_time = a.end_time - timedelta(seconds=abs(target_loc- start_loc)/a.crane.speed)
+                    new_w = BaseAction(f'{pa.name}|insert_wait2',a.crane,a.plan,start_loc,start_loc,pa.end_time,new_start_time,
+                                           False,'wait',a.prev_action,None,pa.end_station,pa.end_station)
+                    new_m = BaseAction(f'{pa.name}|insert_move2',a.crane,a.plan,start_loc,target_loc,new_start_time,a.end_time,
+                                        False,'move',new_w,None,pa.end_station,a.end_station)
+                    if pa.next_action:
+                        pa.next_action = new_w
+                    new_w.next_action = new_m
+                    new_m.next_action = a.next_action
+
+                    if a.next_action:
+                        a.next_action.prev_action = new_m
+                    new_m.prev_action = new_w
+                    new_w.prev_action = pa
+                    return new_w
+                    raise ValueError("行动正常应该不会提前")
+                a.start_loc = start_loc
+                a.start_time = start_time
+                a.end_time = end_time
+            elif 'work' in a.type:
+                if pa.end_loc != a.start_loc:
+                    raise ValueError("工位点为什么位置会不一样")
+                if pa.end_time < a.start_time:
+                    raise ValueError("为什么时间会提前")
+                work_time = a.end_time - a.start_time
+                a.start_time = pa.end_time
+                a.end_time = a.start_time + work_time
+            else:
+                raise ValueError("还有什么类型")
+    
+    search_actions = []
+    for crane in same_span_cranes:
+        if crane != a.crane:
+            search_actions += crane.actions
+    search_actions.sort()
+    j=0
+    splited_actions = False
+    while j<len(search_actions):
+        b = search_actions[j]
+        # if a.crane == b.crane or b.end_time < a.start_time:
+        #     j+=1
+        #     continue
+        # elif b.start_time > a.end_time:
+        #     break
+        if False:pass
+        else:
+            if a.crane.init_position > b.crane.init_position:
+                l,r = a.crane,b.crane
+                dir = 1
+            else:
+                l,r = b.crane,a.crane
+                dir = -1
+            m = l
+            safe_distance = 0
+            while m and m!=r:
+                safe_distance += m.span.safe_distance
+                m = m.right_crane
+            if m is None:
+                raise ValueError("不在同一跨")
+            DELTA = 40
+            safe_distance_delta = safe_distance - DELTA
+            safe_distance *= dir
+            safe_distance_delta *= dir
+            if is_action_segment_cross(a,b,safe_distance_delta):
+                splited_actions = True
+                
+                if 'wait' in a.type:
+                    a2_start_loc = a.start_loc
+                    a2_end_loc = b.end_loc + safe_distance
+                    a2_end_time = b.end_time
+                    a2_start_time = a2_end_time - timedelta(seconds=abs(a2_end_loc - a2_start_loc)/b.crane.speed)
+
+                    a1_start_loc = a.start_loc
+                    a1_end_loc = a.end_loc
+                    a1_start_time = a.start_time
+                    a1_end_time = a2_start_time
+
+                    if a1_end_time<a1_start_time - timedelta(seconds=5):
+                        raise ValueError("应该更提前开始？")
+                    
+
+                    a_avoid_wait_action = BaseAction(f'{a.name}|void_waitA',a.crane,a.plan,a1_start_loc,a1_end_loc,a1_start_time,
+                                                     a1_end_time,False,'avoid_wait',a.prev_action,None,None,None)
+                    a_avoid_move_action = BaseAction(f'{a.name}|void_moveA',a.crane,a.plan,a2_start_loc,a2_end_loc,a2_start_time,
+                                                     a2_end_time,False,'avoid_move',a_avoid_wait_action,None,a.start_station,a.end_station)
+                    assert_action(a_avoid_wait_action),assert_action(a_avoid_move_action)
+                    assert not is_action_segment_cross(a_avoid_wait_action,b,safe_distance_delta)
+                    assert not is_action_segment_cross(a_avoid_move_action,b,safe_distance_delta)
+                    assert_init_position(a_avoid_move_action,b)
+
+                    if a.prev_action is not None:
+                        a.prev_action.next_action = a_avoid_wait_action
+                    a_avoid_wait_action.next_action = a_avoid_move_action
+                    a_avoid_move_action.next_action = a.next_action
+
+                    if a.next_action is not None:
+                        a.next_action.prev_action = a_avoid_move_action
+                    a_avoid_move_action.prev_action = a_avoid_wait_action
+                    a_avoid_wait_action.prev_action = a.prev_action
+                    return a_avoid_wait_action
+                    
+                elif 'work' in a.type:
+
+                    a2_start_loc = a.start_loc
+                    a2_end_loc = b.end_loc + safe_distance
+                    a2_end_time = b.end_time
+                    a2_start_time = a2_end_time - timedelta(seconds=abs(a2_end_loc - a2_start_loc)/b.crane.speed)
+
+                    a1_start_loc = a.start_loc
+                    a1_end_loc = a.end_loc
+                    a1_start_time = a.start_time
+                    a1_end_time = a2_start_time
+
+                    a_avoid_wait_action = BaseAction(f'{a.name}|void_waitB',a.crane,a.plan,a1_start_loc,a1_start_loc,a1_start_time,
+                                                     a1_end_time,False,'avoid_wait',a.prev_action,None,None,None)
+                    a_avoid_move_action = BaseAction(f'{a.name}|void_moveB',a.crane,a.plan,a2_start_loc,a2_end_loc,a2_start_time,
+                                                     a2_end_time,False,'avoid_move',a_avoid_wait_action,None,None,None)
+                    work_time = a.end_time - a.start_time
+                    new_move_end_time = a2_end_time + timedelta(seconds=abs(a.end_loc - a2_end_loc)/a.crane.speed)
+                    a_new_move_action = BaseAction(f"{a.name}|afvoid_moveB",a.crane,a.plan,a2_end_loc,a.end_loc,a2_end_time,
+                                                   new_move_end_time,False,'afvoid_move',a_avoid_move_action,None,None,a.end_station)
+                    a_new_work_action = BaseAction(f"{a.name}|afvoid_workB",a.crane,a.plan,a.end_loc,a.end_loc,new_move_end_time,
+                                                   new_move_end_time+work_time,False,'afvoid_work',a_new_move_action,a.next_action,a.end_station,a.end_station)
+                    assert_action(a_avoid_wait_action),assert_action(a_avoid_move_action)
+                    assert_action(a_new_work_action)
+
+                    assert not is_action_segment_cross(a_avoid_wait_action,b,safe_distance_delta)
+                    assert not is_action_segment_cross(a_avoid_move_action,b,safe_distance_delta)
+                    assert not is_action_segment_cross(a_new_move_action,b,safe_distance_delta)
+                    assert not is_action_segment_cross(a_new_work_action,b,safe_distance_delta)
+
+                    assert_init_position(a_avoid_move_action,b)
+
+                    if a.prev_action is not None:
+                        a.prev_action.next_action = a_avoid_wait_action
+                    a_avoid_wait_action.next_action = a_avoid_move_action
+                    a_avoid_move_action.next_action = a_new_move_action
+                    a_new_move_action.next_action = a_new_work_action
+
+                    if a.next_action is not None:
+                        a.next_action.prev_action = a_new_work_action
+                    a_new_work_action.prev_action = a_new_move_action
+                    a_new_move_action.prev_action = a_avoid_move_action
+                    a_avoid_move_action.prev_action = a_avoid_wait_action
+                    
+
+                    return a_avoid_wait_action
+                elif 'move' in a.type:                    
+                    
+                    a2_start_loc = a.start_loc
+                    a2_end_loc = b.end_loc + safe_distance
+                    a2_end_time = b.end_time
+                    a2_start_time = a2_end_time - timedelta(seconds=abs(a2_end_loc - a2_start_loc)/a.crane.speed)
+
+                    a1_start_loc = a.start_loc
+                    a1_end_loc = a.start_loc
+                    a1_start_time = a.start_time
+                    a1_end_time = a2_start_time
+                    if a1_end_time <a1_start_time:
+                        if a.prev_action.type == 'wait' or a1_start_time-a1_end_time < timedelta(seconds=5):
+                            a1_start_time = a1_end_time
+                            a.prev_action.end_time = a1_end_time
+                            assert_action(a.prev_action)
+                        else:
+                            raise ValueError
+
+                    a3_start_loc = a2_end_loc
+                    a3_end_loc = a.end_loc
+                    a3_start_time = a2_end_time
+                    a3_end_time = a3_start_time + timedelta(seconds=abs((a3_end_loc - a3_start_loc))/a.crane.speed)
+                    
+                    a_avoid_wait_action = BaseAction(f'{a.name}|void_waitC',a.crane,a.plan,a1_start_loc,a1_start_loc,a1_start_time,
+                                                     a1_end_time,False,'avoid_wait',a.prev_action,None,None,None)
+                    a_avoid_move_action = BaseAction(f'{a.name}|void_moveC',a.crane,a.plan,a2_start_loc,a2_end_loc,a2_start_time,
+                                                     a2_end_time,False,'avoid_move',a_avoid_wait_action,None,None,None)
+                    a_new_move_action = BaseAction(f"{a.name}|afvoid_moveC",a.crane,a.plan,a3_start_loc,a3_end_loc,a3_start_time,
+                                                   a3_end_time,False,'afvoid_move',a_avoid_move_action,None,None,a.end_station)
+                    assert_action(a_avoid_wait_action),assert_action(a_avoid_move_action),assert_action(a_new_move_action)
+
+                    assert not is_action_segment_cross(a_avoid_wait_action,b,safe_distance_delta)
+                    assert not is_action_segment_cross(a_avoid_move_action,b,safe_distance_delta)
+                    assert not is_action_segment_cross(a_new_move_action,b,safe_distance_delta)
+
+                    assert_init_position(a_avoid_move_action,b)
+
+                    if a.prev_action is not None:
+                        a.prev_action.next_action = a_avoid_wait_action
+                    a_avoid_wait_action.next_action = a_avoid_move_action
+                    a_avoid_move_action.next_action = a_new_move_action
+                    a_new_move_action.next_action = a.next_action
+
+                    if a.next_action is not None:
+                        a.next_action.prev_action = a_new_move_action
+                    a_avoid_wait_action.prev_action = a.prev_action
+                    a_avoid_move_action.prev_action = a_avoid_wait_action
+                    a_new_move_action.prev_action = a_avoid_move_action
+
+                    return a_avoid_wait_action
+                else:
+                    raise ValueError("应该不会有其他情况")
+                
+                
+                # j+=1
+            else:
+                j+=1
+    if not splited_actions:
+        a.crane.actions.append(a)
+        return a.next_action
+    
+    
+def search_next_plan_by_a_action_choice(plan,cur_crane,action_list,a_action_choise,station_mapper,crane_mapper):
+
+    
+    for crane in crane_mapper.values():
+        crane.actions.clear()
+    for action in action_list:
+        action.crane.actions.append(action)
+
+    for prev_action,next_action in zip(a_action_choise[:-1],a_action_choise[1:]):
+        prev_action.next_action = next_action
+        next_action.prev_action = prev_action
+    
+    cur_action = a_action_choise[0]
+
+    if plan.name == 'PL21_2':
+        if cur_action.name == 'AC|PL21_2|ST1DZ6|ST1GF6_1':
+            pass
+    while cur_action is not None:
+        span = cur_action.crane.span
+        same_span_crans = [e for e in crane_mapper.values() if e.span == span]
+        next_action = do_a_action(cur_action,same_span_crans)
+        cur_action = next_action
+
+    res = []
+    all_action = []
+    for crane in crane_mapper.values():
+        all_action.extend(crane.actions)
+    score = cal_score(crane_mapper)
+    all_action = sorted(all_action,key = lambda z:(z.start_time,z.end_time))
+
+    # for i in range(len(all_action)):
+    #     for j in range(len(all_action)):
+    #         action1 = all_action[i]
+    #         action2 = all_action[j]
+    #         if action1.crane.span != action2.crane.span:
+    #             continue
+    #         if is_action_segment_cross(action1,action2,40) and is_action_segment_cross(action1,action2,-40):
+    #             raise ValueError
+    
+    res.append((score,all_action))
+    return res
+
+def cal_score(crane_mapper):
+    move_dis =0
+    task_delay = 0
+    max_delay = 0
+    for crane in crane_mapper.values():
+        for action in crane.actions:
+            if action.type in {'move','avoid_move'}:
+                abs_dis = abs(action.start_loc - action.end_loc)
+                move_dis -= abs_dis
+            if action.plan is not None and 'work' in action.type and 'down' in action.name.split('|')[-1]:
+                delay = max(action.end_time-action.plan.latest_down_time,timedelta()).seconds
+                task_delay -= delay
+                max_delay = max(max_delay,delay)
+    return [task_delay,move_dis,-max_delay]
+    # return [move_dis,task_delay,-max_delay]
+
+def search_next_plan(o_plan,cur_crane,action_list,station_mapper,crane_mapper,o_plan_mapper):
+    plan = Plan.instance(o_plan.to_json(),o_plan_mapper)
+    all_action_choises = build_multiple_actions_from_plan(plan,cur_crane,action_list,crane_mapper,station_mapper)
+    all_score_and_actions = []
+    for a_action_choise in all_action_choises:
+        score_and_action_lists = search_next_plan_by_a_action_choice(plan,cur_crane,action_list,a_action_choise,station_mapper,crane_mapper)
+        for score_and_action_list in score_and_action_lists:
+            score,scored_action_list = score_and_action_list
+            all_score_and_actions.append((score,scored_action_list))
+    return all_score_and_actions
+
